@@ -371,10 +371,10 @@ export default function Page() {
 
       setStatus(STATUS.GENERATING_PDF);
       addLog("Generando PDF searchable con pdf-lib...");
-      const { PDFDocument, StandardFonts, rgb, PDFName, PDFArray, PDFDict, PDFStream,
-              PDFHexString, PDFNumber, PDFRawStream } = window.PDFLib;
+      const { PDFDocument, StandardFonts, PDFName, PDFArray, PDFDict, PDFNumber } = window.PDFLib;
 
       const pdfDoc = await PDFDocument.create();
+      // Embed helvetica ONCE at document level
       const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
       for (let i = 0; i < pageDataList.length; i++) {
@@ -391,33 +391,14 @@ export default function Page() {
         // Draw image
         page.drawImage(img, { x: 0, y: 0, width: pd.origWidth, height: pd.origHeight });
 
-        // Add OCR text using raw content stream approach
-        // This matches the exact structure PyMuPDF generates for searchable PDFs:
-        // BT /FontName Size Tf 3 Tr 1 0 0 1 X Y Tm (text)Tj ET
         if (pd.ocrWords.length > 0) {
           const sx = pd.origWidth / pd.width;
           const sy = pd.origHeight / pd.height;
 
-          // Get the font key that pdf-lib assigned to helvetica on this page
-          // We need to ensure the font is in the page's Resources
-          // First, draw a dummy text to force pdf-lib to register the font
-          page.drawText(" ", { x: -100, y: -100, size: 1, font: helvetica, opacity: 0 });
-
-          // Now find the font key from the page resources
-          const resources = page.node.get(PDFName.of("Resources"));
-          const fontDict = resources?.get?.(PDFName.of("Font"));
-          let fontKey = "F1"; // default
-          if (fontDict) {
-            const entries = fontDict instanceof PDFDict ? fontDict.entries() : [];
-            for (const [key, val] of entries) {
-              // Find the key that references our helvetica font
-              fontKey = key.toString().replace("/", "");
-              break; // First font should be helvetica
-            }
-          }
-
-          // Build raw content stream with invisible text operators
-          let streamContent = "";
+          // Strategy: use pdf-lib's own drawText with opacity=0.001 (barely-visible but not 0)
+          // This ensures pdf-lib properly registers fonts, manages content streams, and writes
+          // real text operators that ARE in the content stream and ARE extractable.
+          // opacity=0.001 is functionally invisible (0.1% opacity) but not stripped by pdf-lib.
           let wordsAdded = 0;
 
           for (const w of pd.ocrWords) {
@@ -429,48 +410,33 @@ export default function Page() {
             const wordHeight = Math.abs(yBot - yTop);
             if (wordHeight < 1) continue;
 
-            // PDF y-axis: 0 is bottom
+            // PDF y-axis: 0 is bottom. yBot is the bottom of the word in image coords.
             const pdfY = pd.origHeight - yBot;
             const fontSize = Math.max(wordHeight * 0.85, 4);
 
-            // Convert text to hex for PDF
-            let hex = "";
-            let valid = true;
+            // Filter non-latin1 chars (Helvetica is latin1 only)
+            let safeText = "";
             for (let c = 0; c < w.text.length; c++) {
               const code = w.text.charCodeAt(c);
-              if (code > 255) { valid = false; break; } // Skip non-latin1
-              hex += code.toString(16).padStart(2, "0");
+              if (code <= 255) safeText += w.text[c];
             }
-            if (!valid || !hex) continue;
+            if (!safeText.trim()) continue;
 
-            // Exact format that PyMuPDF uses for invisible OCR text:
-            // BT 1 0 0 1 X Y Tm /Font Size Tf 3 Tr <hex>Tj ET
-            streamContent += `BT\n`;
-            streamContent += `1 0 0 1 ${x.toFixed(2)} ${pdfY.toFixed(2)} Tm\n`;
-            streamContent += `/${fontKey} ${fontSize.toFixed(1)} Tf\n`;
-            streamContent += `3 Tr\n`;
-            streamContent += `<${hex}> Tj\n`;
-            streamContent += `ET\n`;
-            wordsAdded++;
+            try {
+              page.drawText(safeText, {
+                x,
+                y: pdfY,
+                size: fontSize,
+                font: helvetica,
+                opacity: 0.001, // NOT zero — pdf-lib doesn't strip this, but it's invisible to users
+              });
+              wordsAdded++;
+            } catch (e) {
+              // skip words that cause errors (encoding issues, etc)
+            }
           }
 
-          if (streamContent && wordsAdded > 0) {
-            // Create a new content stream and append it to the page
-            const streamBytes = new TextEncoder().encode(streamContent);
-            const stream = pdfDoc.context.stream(streamBytes);
-            const streamRef = pdfDoc.context.register(stream);
-
-            // Append this stream to the page's existing Contents array
-            const existingContents = page.node.get(PDFName.of("Contents"));
-            if (existingContents) {
-              // If Contents is a single ref, wrap in array
-              const contentsArray = existingContents instanceof PDFArray
-                ? existingContents
-                : pdfDoc.context.obj([existingContents]);
-              contentsArray.push(streamRef);
-              page.node.set(PDFName.of("Contents"), contentsArray);
-            }
-
+          if (wordsAdded > 0) {
             addLog(`  Pág ${i+1}: ${wordsAdded} palabras en capa OCR`);
           }
         }
